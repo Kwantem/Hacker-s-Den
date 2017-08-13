@@ -1,0 +1,411 @@
+import xmlrpclib
+import readline
+from cpu import CPU, CPUException, UInt16, Memory
+import os
+from helib import BaseCLI, logging
+import sys
+import shlex
+from devices import ConIOHook, FileHook, ACLHook
+
+log = logging.LoggerAdapter(logging.getLogger(__name__), {'pid': os.getpid()})
+
+hosts = xmlrpclib.ServerProxy('https://127.0.0.1:2700/')
+
+class Coder(BaseCLI):
+    intro = 'HackerAsm v0.6'
+    bc16_map = {
+        'in': 3,
+        'out': 4,
+        'jmp': 6,
+        'call': 9,
+        'if=': 15,
+        'if!': 16,
+    }
+    bc_map = {
+        'int': [1,0],
+        'ret': [1,0],
+        'hlt': [5,0],
+        'push': [7,0],
+        'pop': [8,0],
+        'inc': [10,3],
+        'dec': [11,3],
+        'use': [14,3],
+    }
+    bc2_map = {
+        'mov': 2,
+        'add': 12,
+        'sub': 13,
+        'cmp': 17,
+        'mul': 18,
+        'div': 19,
+    }
+    prompt = '0 '
+    @property
+    def var_map(self):
+        _var_map = getattr(self, '_var_map', None)
+        if _var_map is None:
+            regs = self.cpu.var_map
+            _var_map = dict([(reg,regs.index(reg)) for reg in regs])
+            self._var_map = _var_map
+        return _var_map
+    def configure(self, cpu):
+        if not isinstance(cpu, CPU):
+            raise TypeError
+        self.cpu = cpu
+        self.cpu.shell = self
+        self.labels = {}
+        self.cseg = 0
+    def postcmd(self, stop, line):
+        self.prompt = '%s ' % self.cpu.mem.ptr
+        return stop
+    def get_label(self, lbl, reference=True):
+        if lbl[0] == '*':
+            label = lbl[1:]
+            if reference == False:
+                return self.labels[lbl[1:]][0]
+            elif label in self.labels:
+                self.labels[label][1].append(self.cpu.mem.ptr)
+                ptr = self.labels[lbl[1:]][0]
+            else:
+                self.labels[label] = [0,[self.cpu.mem.ptr]]
+                ptr = 0
+            return ptr
+        return lbl
+    def get_int(self, arg):
+        try:
+            return int(arg)
+        except:
+            pass
+        try:
+            return self.var_map[arg]
+        except:
+            return 0
+    def default(self, line):
+        if line == '.':
+            return True
+        s = shlex.split(line)
+        op, arg = s[0], ''
+        if len(s) > 1:
+            try:
+                ptr = int(s[0])
+                self.cpu.mem.ptr = ptr
+                op = s[1]
+            except:
+                arg = s[1]
+        if len(s) in [3,4]:
+            try:
+                ptr, op, arg = int(s[0]), s[1], s[2]
+                self.cpu.mem.ptr = ptr
+            except:
+                pass
+        if op in self.bc16_map:
+            # This map is for operations which can take a 16-bit integer parameter.
+            self.cpu.mem.write(self.bc16_map[op])
+            if arg != '':
+                if ',' in arg:
+                    a1,a2 = arg.split(',')
+                    self.cpu.mem.write16(self.get_int(a1))
+                    self.cpu.mem.write16(self.get_int(a2))
+                else:
+                    arg = self.get_label(arg)
+                    self.cpu.mem.write16(int(arg))
+        elif op in self.bc_map:
+            # This map is for operations which can take an 8-bit integer parameter.
+            self.cpu.mem.write(self.bc_map[op][0])
+            if arg == '':
+                self.cpu.mem.write(int(self.bc_map[op][1]))
+            else:
+                self.cpu.mem.write(self.get_int(arg))
+        elif op in self.bc2_map:
+            # This map is for complex operations that support mixed parameter types, like the MOV instruction.
+            try:
+                a1,a2 = arg.split(',')
+            except:
+                self.unknown_command(line)
+                return
+            self.cpu.mem.write(self.bc2_map[op])
+            xop = 0
+            if a1.startswith('&'):
+                xop+=4
+                a1 = a1[1:]
+            if a2.startswith('&'):
+                xop+=8
+                a2 = a2[1:]
+            if a1 in self.var_map:
+                xop+=1
+                a1 = self.var_map[a1]
+            if a2 in self.var_map:
+                xop+=2
+                a2 = self.var_map[a2]
+            if xop in [0,2,8,12,15]:
+                self.unknown_command(line)
+                return
+            self.cpu.mem.write(xop)
+            if isinstance(a1, str):
+                a1 = self.get_label(a1)
+                self.cpu.mem.write16(int(a1))
+            else:
+                self.cpu.mem.write(int(a1))
+            if isinstance(a2, str):
+                a2 = self.get_label(a2)
+                self.cpu.mem.write16(int(a2))
+            else:
+                self.cpu.mem.write(int(a2))
+        else:
+            self.unknown_command(line)
+    def do_boot(self, args):
+        """ Executes the code currently in memory at an optional memory pointer location. """
+        if args != '':
+            ptr = int(args)
+        else:
+            ptr = self.cpu.mem.ptr
+        try:
+            rt = self.cpu.run(ptr)
+            self.stdout.write('Exit Code: %s\n' % rt)
+        except CPUException, e:
+            print e
+    def do_ptr(self, args):
+        """ Sets or returns the current pointer location in memory. """
+        if args != '':
+            args = self.get_label(args, False)
+            self.cpu.mem.ptr = int(args)
+        else:
+            print self.cpu.mem.ptr
+    def do_label(self, args):
+        """ Sets or prints a list of pointer variables. """
+        if args != '':
+            if args.startswith('!'):
+                self.cseg = 0
+            if args in self.labels:
+                self.labels[args][0] = self.cpu.mem.ptr-self.cseg
+                for ptr in self.labels[args][1]:
+                    self.cpu.mem[ptr] = UInt16(self.labels[args][0])
+            else:
+                self.labels[args] = [self.cpu.mem.ptr-self.cseg, []]
+            if args.startswith('!'):
+                self.cseg = self.cpu.mem.ptr
+        else:
+            lbl = []
+            for label in self.labels:
+                lbl.append('%s=%s' % (label, self.labels[label]))
+            self.columnize(lbl)
+    def do_cseg(self, args):
+        """ Sets the current code-segment for the pointer label system. """
+        if args != '':
+            self.cseg = int(args)
+        else:
+            self.cseg = self.cpu.mem.ptr
+    def do_dump(self, args):
+        """ Dumps the byte at the current memory location. """
+        if args != '':
+            ptr = int(args)
+        else:
+            ptr = self.cpu.mem.ptr
+        byte = self.cpu.mem[ptr]
+        self.stdout.write("%s" % byte.b)
+        if byte.b > 64:
+            self.stdout.write(' / %s' % byte.c)
+        self.stdout.write('\n')
+    def do_dump16(self, args):
+        """ Dumps a 16-bit integer from the current memory location. """
+        if args != '':
+            optr = self.cpu.mem.ptr
+            self.cpu.mem.ptr = int(args)
+        self.stdout.write("%s\n" % self.cpu.mem.read16().b)
+        if args != '':
+            self.cpu.mem.ptr = optr
+    def do_savebin(self, args):
+        """ Saves the current binary image in memory to disc. """
+        s = shlex.split(args)
+        if len(s) > 0:
+            log.info('User saved binary image: %s:%s' % (self.cpu.host, s[0]))
+            if len(s) == 1:
+                self.cpu.savebin(s[0], 0, self.cpu.mem.ptr)
+            else:
+                self.cpu.savebin(s[0], self.cpu.mem.ptr, int(s[1]))
+    def do_loadbin(self, args):
+        """ Loads a binary image from disc into memory. """
+        s = shlex.split(args)
+        if len(s) > 0:
+            log.info('User loading binary image: %s:%s' % (self.cpu.host, s[0]))
+            self.cpu.loadbin(s[0], self.cpu.mem.ptr)
+    def do_clear(self, args):
+        """ Clears the current data in memory. """
+        self.cpu.mem = Memory(1024)
+        readline.clear_history()
+    def do_cpumem(self, args):
+        """ Loads in the current CPU memory. """
+        self.cpu.get_host(4096)
+    def do_data(self, args):
+        """ Stores a zero-terminated string to the current memory address. """
+        s = shlex.split(args)
+        if len(s) > 0:
+            data = s[0].replace('\\n', '\n').replace('\\x00', '\x00')
+            for c in data:
+                self.cpu.mem.write(ord(c))
+            self.cpu.mem.write(0)
+    def do_set(self, args):
+        """ Stores a raw byte at the current memory location. """
+        if args != '':
+            self.cpu.mem.write(int(args))
+    def do_bp(self, args):
+        """ Sets a breakpoint at the current memory location. """
+        if args != '':
+            self.cpu.bp = int(args)
+        else:
+            self.cpu.bp = self.cpu.mem.ptr
+    def do_cbp(self, args):
+        """ Clears a currently set breakpoint. """
+        del self.cpu.bp
+    def do_source(self, args):
+        """ Loads in a source file. """
+        s = shlex.split(args)
+        if len(s) != 1:
+            self.stdout.write('Please specify a filename to read in.\n')
+            return False
+        try:
+            script = open(self.cpu.get_fname(s[0]), 'r').readlines()
+            for line in script:
+                self.cmdqueue.append(line)
+        except:
+            self.stdout.write('Error loading source.\n')
+    def do_registers(self, args):
+        """ Prints the current state of the CPU registers. """
+        reglist = []
+        for reg in self.cpu.regs.registers:
+            reglist.append('%s=%s\t' % (reg.upper(), getattr(self.cpu, reg).b))
+        self.columnize(reglist)
+    def do_memcopy(self, args):
+        """ Performs a memory copy operation. """
+        s = shlex.split(args)
+        if len(s) != 3:
+            self.stdout.write('Please specify the following: src, dest, size\n')
+            return False
+        try:
+            self.cpu.mem.memcopy(int(s[0]), int(s[1]), int(s[2]))
+        except:
+            self.stdout.write('There was an error during the copy operation.\n')
+    def do_memclear(self, args):
+        """ Clear a specific segment of memory. """
+        s = shlex.split(args)
+        if len(s) != 2:
+            self.stdout.write('Please specify the following: src, size\n')
+            return False
+        try:
+            self.cpu.mem.memclear(int(s[0]), int(s[1]))
+        except:
+            self.stdout.write('There was an error during the memory clear operation.\n')
+    def do_memmove(self, args):
+        """ Moves a segment of memory to a new location. """
+        s = shlex.split(args)
+        if len(s) != 3:
+            self.stdout.write('Please specify the following: src, dest, size\n')
+            return False
+        optr = self.cpu.mem.ptr
+        try:
+            src = int(s[0])
+            dest = int(s[1])
+            size = int(s[2])
+        except:
+            self.stdout.write('Please provide numeric parameters only.\n')
+            return False
+        try:
+            self.cpu.mem.ptr = src
+            buf = self.cpu.mem.read(size)
+        except:
+            self.stdout.write('There was an error during the read operation.\n')
+            self.cpu.mem.ptr = optr
+            return False
+        try:
+            self.cpu.mem.memclear(src, size)
+        except:
+            self.stdout.write('There was an error during the clear operation.\n')
+            self.cpu.mem.ptr = src
+            self.cpu.mem.write(buf)
+            self.cpu.mem.ptr = optr
+            return False
+        try:
+            self.cpu.mem.ptr = dest
+            old = self.cpu.mem.read(size)
+            self.cpu.mem.ptr = dest
+            self.cpu.mem.write(buf)
+        except:
+            self.stdout.write('There was an error during the write operation.\n')
+            self.cpu.mem.ptr = dest
+            self.cpu.mem.write(old)
+            self.cpu.mem.ptr = src
+            self.cpu.mem.write(buf)
+            self.cpu.mem.ptr = optr
+    def do_stepping(self, args):
+        """ Turn on or off register stepping for each command run. """
+        if args == 'off':
+            del self.cpu.stepping
+        else:
+            self.cpu.stepping = True
+    def do_savecode(self, args):
+        """ Save your history of typed commands. """
+        s = shlex.split(args)
+        if len(s) == 1:
+            readline.write_history_file('/tmp/%s.asm' % s[0])
+            os.chmod('/tmp/%s.asm' % s[0], 33188)
+            if not hosts.create_file('/tmp/%s.asm' % s[0], self.cpu.host):
+                print "There was an error saving your file."
+            os.unlink('/tmp/%s.asm' % s[0])
+    def help_usage(self):
+        self.show_help('asm')
+
+log.info('User launched HackerCode assembler.')
+
+c = CPU()
+c.mem = Memory(1024)
+c.host = os.environ['HE_HOST']
+c.host_data = hosts.get_host(c.host)
+c.username = os.environ['LOGNAME']
+c.add_cpu_hook(ConIOHook)
+c.add_cpu_hook(FileHook)
+c.add_cpu_hook(ACLHook)
+
+cli = Coder()
+cli.configure(c)
+
+if len(sys.argv) > 1:
+    fname = sys.argv[1].split('.')
+    if fname[-1] in ['src', 'asm']:
+        log.info('User loaded source file: %s:%s' % (c.host, sys.argv[1]))
+        try:
+            script = open(c.get_fname(sys.argv[1]), 'r').readlines()
+        except:
+            print "File not found."
+            os.execl('/srv/bin/hsh', '', '--skip-intro')
+        for line in script:
+            cli.cmdqueue.append(line)
+        cli.cmdqueue.append('savebin %s.bin' % fname[0])
+        cli.cmdqueue.append('.')
+    else:
+        log.info('User loaded binary image: %s:%s' % (c.host, sys.argv[1]))
+        c.loadbin(sys.argv[1])
+
+try:
+    cli.cmdloop()
+except:
+    c.hook_cleanup()
+    if sys.exc_type == KeyboardInterrupt:
+        print "^C"
+        log.warning('User attempted to press Ctrl-C.')
+    elif sys.exc_type == IOError:
+        print "Unsupported file syntax!"
+        log.critical('User attempted to access invalid file: %s' % sys.exc_info()[1])
+    else:
+        import traceback
+        hosts.send_mail('traceback@%s' % c.host, 'chronoboy@96.164.6.6', '%s: %s' % (sys.exc_info()[0], sys.exc_info()[1]), '\n'.join(traceback.format_tb(sys.exc_info()[2])))
+        err_msg = "[%s](%s) There was an error in your application." % (c.mem.ptr, sys.exc_info()[1])
+        log.critical(err_msg)
+        if sys.exc_type == CPUException:
+            hosts.logit(c.host, err_msg)
+            hosts.logit(c.host, "AX=%s, BX=%s, CX=%s, DX=%s" % (c.ax.b, c.bx.b, c.cx.b, c.dx.b))
+            print err_msg
+            print "AX=%s, BX=%s, CX=%s, DX=%s" % (c.ax.b, c.bx.b, c.cx.b, c.dx.b)
+        else:
+            print "An unknown error has occurred!  System Administrator has been notified."
+
+os.execl('/srv/bin/hsh', '', '--skip-intro')
